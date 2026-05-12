@@ -58,6 +58,22 @@
 #include "stats.h"
 #include "autogroup.h"
 
+#ifdef CONFIG_IPC_CLASSES
+/*
+ * Number of scheduler ticks an E-type task (ipcc==1) is blocked from being
+ * pulled back to a P-core after being pushed out. At 1kHz this is ~128ms.
+ * Conservative enough to avoid thrashing, short enough to react to sustained
+ * workload changes that flip the task's classification to P-type.
+ */
+#define IPCC_PIN_TICKS			128
+
+/*
+ * ITMT priority threshold separating E-cores from P-cores.
+ * Must match the value in arch/x86/kernel/sched_ipcc.c.
+ */
+#define IPCC_ECORE_PRIO_THRESHOLD	50
+#endif
+
 /*
  * The initial- and re-scaling of tunables is configurable
  *
@@ -8628,6 +8644,32 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)// mudar
 	}
 	rcu_read_unlock();
 
+#ifdef CONFIG_IPC_CLASSES
+	/*
+	 * If an E-type task still has its P-core pin window active, honour it
+	 * at wakeup time too — not only in the load-balancer pull path.
+	 * Prefer prev_cpu (cache-warm E-core), otherwise take the first
+	 * E-core in the task's allowed mask.  Fall through unchanged if the
+	 * system has no accessible E-core (e.g. cpuset restricted to P-cores).
+	 */
+	if (sched_ipcc_enabled() && p->ipcc == 1 &&
+	    READ_ONCE(p->ipcc_pin_ticks) > 0 &&
+	    arch_asym_cpu_priority(new_cpu) > IPCC_ECORE_PRIO_THRESHOLD) {
+		int ecpu;
+
+		if (cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+		    arch_asym_cpu_priority(prev_cpu) <= IPCC_ECORE_PRIO_THRESHOLD)
+			return prev_cpu;
+
+		for_each_cpu(ecpu, p->cpus_ptr) {
+			if (arch_asym_cpu_priority(ecpu) <= IPCC_ECORE_PRIO_THRESHOLD) {
+				new_cpu = ecpu;
+				break;
+			}
+		}
+	}
+#endif
+
 	return new_cpu;
 }
 
@@ -9541,6 +9583,18 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	/* Record that we found at least one task that could run on dst_cpu */
 	env->flags &= ~LBF_ALL_PINNED;
 
+#ifdef CONFIG_IPC_CLASSES
+	/*
+	 * Block E-type tasks (ipcc==1) from being pulled back to P-cores
+	 * while their protection window is active. This prevents the
+	 * thrashing that would occur if the load balancer immediately
+	 * re-pulled a task that was just pushed to an E-core.
+	 */
+	if (p->ipcc == 1 && READ_ONCE(p->ipcc_pin_ticks) > 0 &&
+	    sched_asym_prefer(env->dst_cpu, env->src_cpu))
+		return 0;
+#endif
+
 	if (task_on_cpu(env->src_rq, p) ||
 	    task_current_donor(env->src_rq, p)) {
 		schedstat_inc(p->stats.nr_failed_migrations_running);
@@ -9604,6 +9658,29 @@ static struct task_struct *detach_one_task(struct lb_env *env)
 	struct task_struct *p;
 
 	lockdep_assert_rq_held(env->src_rq);
+
+#ifdef CONFIG_IPC_CLASSES
+	/*
+	 * When pulling from a P-core to an E-core, prefer E-type tasks
+	 * (ipcc==1). They benefit least from P-core resources and are the
+	 * natural candidates to offload. Do a dedicated first pass; if none
+	 * is found, fall through to the generic pass below.
+	 */
+	if (sched_ipcc_enabled() && sched_asym_prefer(env->src_cpu, env->dst_cpu)) {
+		list_for_each_entry_reverse(p,
+				&env->src_rq->cfs_tasks, se.group_node) {
+			if (p->ipcc != 1)
+				continue;
+			if (!can_migrate_task(p, env))
+				continue;
+
+			detach_task(p, env);
+			WRITE_ONCE(p->ipcc_pin_ticks, IPCC_PIN_TICKS);
+			schedstat_inc(env->sd->lb_gained[env->idle]);
+			return p;
+		}
+	}
+#endif
 
 	list_for_each_entry_reverse(p,
 			&env->src_rq->cfs_tasks, se.group_node) {
@@ -9676,6 +9753,21 @@ static int detach_tasks(struct lb_env *env)
 		if (!can_migrate_task(p, env))
 			goto next;
 
+#ifdef CONFIG_IPC_CLASSES
+		/*
+		 * When pushing tasks from a P-core to an E-core, protect
+		 * P-type tasks (ipcc==2) from being displaced as long as there
+		 * are E-type (ipcc==1) or unclassified (ipcc==0) alternatives
+		 * still on the source runqueue. Only yield P-type tasks if we
+		 * have no other choice.
+		 */
+		if (sched_ipcc_enabled() &&
+		    sched_asym_prefer(env->src_cpu, env->dst_cpu) &&
+		    p->ipcc == 2 &&
+		    (env->src_rq->nr_ipcc[0] + env->src_rq->nr_ipcc[1]))
+			goto next;
+#endif
+
 		switch (env->migration_type) {
 		case migrate_load:
 			/*
@@ -9727,6 +9819,14 @@ static int detach_tasks(struct lb_env *env)
 
 		detach_task(p, env);
 		list_add(&p->se.group_node, &env->tasks);
+
+#ifdef CONFIG_IPC_CLASSES
+		/* Arm the protection window for E-type tasks pushed to E-cores. */
+		if (sched_ipcc_enabled() &&
+		    p->ipcc == 1 &&
+		    sched_asym_prefer(env->src_cpu, env->dst_cpu))
+			WRITE_ONCE(p->ipcc_pin_ticks, IPCC_PIN_TICKS);
+#endif
 
 		detached++;
 
@@ -13735,6 +13835,11 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 
 	update_misfit_status(curr, rq);
 	check_update_overutilized_status(task_rq(curr));
+
+#ifdef CONFIG_IPC_CLASSES
+	if (curr->ipcc_pin_ticks > 0)
+		curr->ipcc_pin_ticks--;
+#endif
 
 	task_tick_core(rq, curr);
 }

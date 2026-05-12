@@ -839,9 +839,11 @@ struct task_struct {
 	randomized_struct_fields_start
 
 #ifdef CONFIG_IPC_CLASSES
-	unsigned short		ipcc;		/* confirmed class (0 = unclassified) */
-	unsigned short		ipcc_prev;	/* previous candidate from MSR */
-	unsigned char		ipcc_stable_count; /* consecutive identical readings */
+	unsigned short		ipcc;		/* confirmed class: 0=unclassified, 1=E-type, 2=P-type */
+	u16			ipcc_pin_ticks;	/* remaining ticks blocking return to P-cores */
+	unsigned int		ipcc_ticks_E;	/* accumulator for E-core classifications */
+	unsigned int		ipcc_ticks_P;	/* accumulator for P-core classifications */
+	unsigned int		ipcc_total_ticks; /* total ticks for exponential decay */
 #endif
 
 	void				*stack;
